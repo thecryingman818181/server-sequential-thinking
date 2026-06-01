@@ -121,7 +121,7 @@ class SequentialThinkingServer {
             nextThoughtNeeded: validatedInput.nextThoughtNeeded,
             branches: Object.keys(this.branches),
             thoughtsRecordedThisSession: this.thoughtHistory.length,
-            guidance: "Use thoughtNumber and totalThoughts as your loop counters; call again with the next thoughtNumber until nextThoughtNeeded is false. The thoughtsRecordedThisSession field only counts calls within one kept-open server session and may stay at 1 if your client opens a new session per call, which is expected and not an error."
+            guidance: validatedInput.thoughtNumber === 1 ? "Use thoughtNumber and totalThoughts as your loop counters; call again with the next thoughtNumber until nextThoughtNeeded is false. The thoughtsRecordedThisSession field only counts calls within one kept-open server session and may stay at 1 if your client opens a new session per call, which is expected and not an error." : undefined
           }, null, 2)
         }]
       };
