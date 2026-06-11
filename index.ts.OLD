@@ -1,24 +1,12 @@
 #!/usr/bin/env node
 
-/**
- * Sequential Thinking MCP Server — Streamable HTTP
- * FORK: thecryingman818181
- *
- * v0.3.0 "Stateful Hardening" — UNDER TEST on a fork. See CHANGELOG.md.
- * Changes vs 0.2.0 (each a hypothesis to verify, not assumed):
- *   1. CORS: expose `Mcp-Session-Id` response header so CORS clients can reuse it.
- *   2. Per-session MCP `Server` (was one shared `Server`) — kills the response
- *      mis-route race that caused intermittent 499 hangs.
- *   3. Return 404 (not 400) for an unknown/expired session so clients re-init.
- * The known-good 0.2.0 instance stays frozen as the control.
- */
-
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
   Tool,
+  InitializeRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 // Fixed chalk import for ESM
 import chalk from 'chalk';
@@ -39,11 +27,8 @@ interface ThoughtData {
   nextThoughtNeeded: boolean;
 }
 
-// Per-session state. NOTE (0.3.0): `thinking` is this session's own
-// SequentialThinkingServer; the per-session MCP `Server` closes over it
-// directly, so there is no longer any shared server state across sessions.
 interface SessionState {
-  thinking: SequentialThinkingServer;
+  server: SequentialThinkingServer;
   lastAccessed: number;
 }
 
@@ -263,45 +248,6 @@ You should:
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-/**
- * v0.3.0 FIX #2: build a fresh, isolated MCP Server for each session.
- * Each Server closes over its own SequentialThinkingServer, so no two
- * sessions ever share request-handler state or a transport binding. This
- * removes the shared-Server response mis-route race behind the 499 hangs.
- */
-function createSessionServer(thinking: SequentialThinkingServer): Server {
-  const mcpServer = new Server(
-    {
-      name: "sequential-thinking-server",
-      version: "0.3.0",
-    },
-    {
-      capabilities: {
-        tools: {},
-      },
-    }
-  );
-
-  mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [SEQUENTIAL_THINKING_TOOL],
-  }));
-
-  mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
-    if (request.params.name === "sequentialthinking") {
-      return thinking.processThought(request.params.arguments);
-    }
-    return {
-      content: [{
-        type: "text",
-        text: `Unknown tool: ${request.params.name}`
-      }],
-      isError: true
-    };
-  });
-
-  return mcpServer;
-}
-
 async function runServer() {
   const app = express();
   const port = parseInt(process.env.PORT || '3000', 10);
@@ -334,9 +280,6 @@ async function runServer() {
 
     res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Content-Type, mcp-session-id');
-    // v0.3.0 FIX #1: expose the session-id header so CORS clients can READ it
-    // and reuse the session instead of opening a new one on every call.
-    res.header('Access-Control-Expose-Headers', 'Mcp-Session-Id');
 
     if (req.method === 'OPTIONS') {
       res.sendStatus(200);
@@ -350,8 +293,53 @@ async function runServer() {
 
   // Map to store transports by session ID
   const transports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
-  // Map to store session-specific state (its own thinking server + last access)
+  // Map to store session-specific thinking servers
   const sessionStates: { [sessionId: string]: SessionState } = {};
+
+  // Create a single, centralized MCP Server
+  const server = new Server(
+    {
+      name: "sequential-thinking-server",
+      version: "0.2.0",
+    },
+    {
+      capabilities: {
+        tools: {},
+      },
+    }
+  );
+
+  // Centralized request handlers
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [SEQUENTIAL_THINKING_TOOL],
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request, transport) => {
+    const sessionId = (transport as unknown as StreamableHTTPServerTransport).sessionId;
+    if (!sessionId || !sessionStates[sessionId]) {
+      return {
+        content: [{ type: "text", text: "Session not found for tool call" }],
+        isError: true,
+      };
+    }
+
+    // Update last accessed time on tool call
+    sessionStates[sessionId].lastAccessed = Date.now();
+
+    const thinkingServer = sessionStates[sessionId].server;
+
+    if (request.params.name === "sequentialthinking") {
+      return thinkingServer.processThought(request.params.arguments);
+    }
+
+    return {
+      content: [{
+        type: "text",
+        text: `Unknown tool: ${request.params.name}`
+      }],
+      isError: true
+    };
+  });
 
   // Serve the test page
   app.get('/', (req: Request, res: Response): void => {
@@ -366,21 +354,15 @@ async function runServer() {
     if (sessionId && transports[sessionId]) {
       // Reuse existing transport
       transport = transports[sessionId];
-      // Touch last-accessed so an active session is not reaped mid-use.
-      if (sessionStates[sessionId]) {
-        sessionStates[sessionId].lastAccessed = Date.now();
-      }
     } else if (!sessionId && req.body?.method === 'initialize') {
-      // New initialization request — give this session its OWN server + state.
-      const thinking = new SequentialThinkingServer();
-      const mcpServer = createSessionServer(thinking);
-
+      // New initialization request
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (newSessionId: string) => {
+          // Store the transport and create a new session state
           transports[newSessionId] = transport;
           sessionStates[newSessionId] = {
-            thinking,
+            server: new SequentialThinkingServer(),
             lastAccessed: Date.now(),
           };
           console.error(`New session initialized: ${newSessionId}`);
@@ -396,24 +378,10 @@ async function runServer() {
         }
       };
 
-      // Connect THIS session's dedicated server to its transport.
-      await mcpServer.connect(transport);
-    } else if (sessionId && !transports[sessionId]) {
-      // v0.3.0 FIX #3: a session id was supplied but we no longer have it
-      // (expired / reaped / server restarted). Per the MCP spec, answer 404
-      // so a compliant client knows to start a NEW session by re-initializing,
-      // instead of wedging on a 400.
-      res.status(404).json({
-        jsonrpc: '2.0',
-        error: {
-          code: -32001,
-          message: 'Session not found or expired. Please re-initialize with a new session.',
-        },
-        id: (req.body && req.body.id) ?? null,
-      });
-      return;
+      // Connect the transport to the central server
+      await server.connect(transport);
     } else {
-      // No session id and not an initialize request → genuinely malformed.
+      // Invalid request
       res.status(400).json({
         jsonrpc: '2.0',
         error: {
@@ -433,14 +401,8 @@ async function runServer() {
   const handleSessionRequest = async (req: Request, res: Response) => {
     // Check header first, then query parameter (for EventSource compatibility)
     const sessionId = req.headers['mcp-session-id'] as string | undefined || req.query.sessionId as string | undefined;
-
-    if (!sessionId) {
-      res.status(400).send('Missing session ID');
-      return;
-    }
-    if (!transports[sessionId]) {
-      // v0.3.0 FIX #3: unknown/expired session → 404 (re-initialize), not 400.
-      res.status(404).send('Session not found or expired. Please re-initialize.');
+    if (!sessionId || !transports[sessionId]) {
+      res.status(400).send('Invalid or missing session ID');
       return;
     }
 
@@ -465,7 +427,6 @@ async function runServer() {
     res.json({
       status: 'ok',
       transport: 'streamable-http',
-      version: '0.3.0',
       activeSessions: sessionCount
     });
   });
@@ -497,7 +458,7 @@ async function runServer() {
 
   // Start server on configured host
   app.listen(port, host, () => {
-    console.error(`Sequential Thinking MCP Server (Streamable HTTP) v0.3.0 running on http://${host}:${port}`);
+    console.error(`Sequential Thinking MCP Server (Streamable HTTP) running on http://${host}:${port}`);
     console.error(`MCP endpoint: http://${host}:${port}/mcp`);
     console.error(`Test interface: http://${host}:${port}/`);
     if (process.env.DOCKER === 'true') {
